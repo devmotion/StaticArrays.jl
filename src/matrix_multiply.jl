@@ -255,6 +255,18 @@ numbers, see #513). The value corresponds to the 8×6 block of `Float64` values 
 const MUL_TILE_BUDGET = 384
 
 """
+    MUL_UNROLL_BUDGET
+
+Maximum value of `M * N * K * s` for which `mul_tiled!` unrolls all loops, where `M`×`N` is
+the size of the product, `K` is the inner dimension, and `s` is the size of the elements in
+bytes.
+
+For small products, the overhead of the loops over blocks and over the inner dimension is
+significant. The amount of unrolled arithmetic code is still bounded by the budget.
+"""
+const MUL_UNROLL_BUDGET = 2048
+
+"""
     mul_tile(M, N, s, budget)
 
 Size `(mr, nr)` of the block of accumulators of `mul_tiled!` for a product of size `M`×`N`
@@ -285,37 +297,55 @@ mul_tile_accs(mr::Int, nr::Int) = [Symbol(:acc_, r, :_, c) for r in 1:mr, c in 1
 # Linear indices are used since, in contrast to `getindex` with two indices, `getindex` of an
 # `SMatrix` with a linear index does not involve `checkbounds` (which, even though it is
 # removed by `@inbounds`, increases the amount of code to be inferred and inlined).
-function mul_tile_expr(store, M::Int, K::Int, mr::Int, nr::Int, @nospecialize(i0), @nospecialize(j0))
+# If `unroll` is `true`, the loop over the inner dimension is unrolled.
+function mul_tile_expr(store, M::Int, K::Int, mr::Int, nr::Int, @nospecialize(i0), @nospecialize(j0), unroll::Bool)
     avals = [Symbol(:a_, r) for r in 1:mr]
     bvals = [Symbol(:b_, c) for c in 1:nr]
     accs = mul_tile_accs(mr, nr)
     load_a(k) = [:($(avals[r]) = @inbounds a[$i0 + $r + ($k - 1) * $M]) for r in 1:mr]
     load_b(k) = [:($(bvals[c]) = @inbounds b[$k + ($j0 + $(c - 1)) * $K]) for c in 1:nr]
+    updates = [:($(accs[r, c]) = muladd($(avals[r]), $(bvals[c]), $(accs[r, c]))) for r in 1:mr, c in 1:nr]
+    if unroll
+        loop = Expr(:block)
+        for k in 2:K
+            append!(loop.args, load_a(k))
+            append!(loop.args, load_b(k))
+            append!(loop.args, map(copy, updates))
+        end
+    else
+        loop = :(for k in 2:$K
+            $(load_a(:k)...)
+            $(load_b(:k)...)
+            $(updates...)
+        end)
+    end
     return quote
         $(load_a(1)...)
         $(load_b(1)...)
         $([:($(accs[r, c]) = $(avals[r]) * $(bvals[c])) for r in 1:mr, c in 1:nr]...)
-        for k in 2:$K
-            $(load_a(:k)...)
-            $(load_b(:k)...)
-            $([:($(accs[r, c]) = muladd($(avals[r]), $(bvals[c]), $(accs[r, c]))) for r in 1:mr, c in 1:nr]...)
-        end
+        $loop
         $([store(:($i0 + $r), :($j0 + $c), accs[r, c]) for r in 1:mr, c in 1:nr]...)
     end
 end
 
 # Compute columns `j0 + 1`, ..., `j0 + nc` of `a * b` in blocks with at most `mr` rows
-function mul_tile_cols_expr(store, M::Int, K::Int, mr::Int, nc::Int, @nospecialize(j0))
+# If `unroll` is `true`, all loops are unrolled.
+function mul_tile_cols_expr(store, M::Int, K::Int, mr::Int, nc::Int, @nospecialize(j0), unroll::Bool)
     Mf = M - M % mr
     # No loop over a single block: Inference iterates over loops until convergence
-    ex = if Mf == mr
-        mul_tile_expr(store, M, K, mr, nc, 0, j0)
+    if Mf == mr
+        ex = mul_tile_expr(store, M, K, mr, nc, 0, j0, unroll)
+    elseif unroll
+        ex = Expr(:block)
+        for i0 in 0:mr:(Mf - mr)
+            push!(ex.args, mul_tile_expr(store, M, K, mr, nc, i0, j0, unroll))
+        end
     else
-        :(for i0 in 0:$mr:$(Mf - mr)
-            $(mul_tile_expr(store, M, K, mr, nc, :i0, j0))
+        ex = :(for i0 in 0:$mr:$(Mf - mr)
+            $(mul_tile_expr(store, M, K, mr, nc, :i0, j0, unroll))
         end)
     end
-    return Mf < M ? Expr(:block, ex, mul_tile_expr(store, M, K, M - Mf, nc, Mf, j0)) : ex
+    return Mf < M ? Expr(:block, ex, mul_tile_expr(store, M, K, M - Mf, nc, Mf, j0, unroll)) : ex
 end
 
 # Compute the `M`×`N` product `a * b` with inner dimension `K >= 1` in blocks of size
@@ -323,19 +353,26 @@ end
 # store its entries with the expressions `store(i, j, acc)`.
 # Only the computation of a single block is unrolled, so the generated code consists of at
 # most four variants of the block (including the blocks at the bottom and right edges).
+# Small products (see `MUL_UNROLL_BUDGET`) are unrolled completely.
 # The products are accumulated in the same order as in `mul_loop`.
 function mul_tiled_expr(store, M::Int, K::Int, N::Int, s::Int)
     mr, nr = mul_tile(M, N, s, MUL_TILE_BUDGET)
+    unroll = M * N * K * s <= MUL_UNROLL_BUDGET
     Nf = N - N % nr
     # No loop over a single column of blocks (see `mul_tile_cols_expr`)
-    ex = if Nf == nr
-        mul_tile_cols_expr(store, M, K, mr, nr, 0)
+    if Nf == nr
+        ex = mul_tile_cols_expr(store, M, K, mr, nr, 0, unroll)
+    elseif unroll
+        ex = Expr(:block)
+        for j0 in 0:nr:(Nf - nr)
+            push!(ex.args, mul_tile_cols_expr(store, M, K, mr, nr, j0, unroll))
+        end
     else
-        :(for j0 in 0:$nr:$(Nf - nr)
-            $(mul_tile_cols_expr(store, M, K, mr, nr, :j0))
+        ex = :(for j0 in 0:$nr:$(Nf - nr)
+            $(mul_tile_cols_expr(store, M, K, mr, nr, :j0, unroll))
         end)
     end
-    return Nf < N ? Expr(:block, ex, mul_tile_cols_expr(store, M, K, mr, N - Nf, Nf)) : ex
+    return Nf < N ? Expr(:block, ex, mul_tile_cols_expr(store, M, K, mr, N - Nf, Nf, unroll)) : ex
 end
 
 # Compute `a * b` in blocks with `mul_tiled!`
@@ -349,7 +386,9 @@ end
 
     M, K = sa
     N = sb[2]
-    if M > 0 && N > 0 && K > 0 && mul_tile(M, N, max(sizeof(Ta), sizeof(Tb), 1), MUL_TILE_BUDGET) == (M, N)
+    s = max(sizeof(Ta), sizeof(Tb), 1)
+    if M > 0 && N > 0 && K > 0 && mul_tile(M, N, s, MUL_TILE_BUDGET) == (M, N)
+        unroll = M * N * K * s <= MUL_UNROLL_BUDGET
         return quote
             @_inline_meta
             T = promote_op(matprod, Ta, Tb)
@@ -357,7 +396,7 @@ end
             # `getindex` of an `MArray` preserves it for every element, unlike an `SMatrix`
             a = SMatrix{$M, $K, Ta}(Tuple(a))
             b = SMatrix{$K, $N, Tb}(Tuple(b))
-            $(mul_tile_expr((i, j, acc) -> nothing, M, K, M, N, 0, 0))
+            $(mul_tile_expr((i, j, acc) -> nothing, M, K, M, N, 0, 0, unroll))
             return TC(tuple($(mul_tile_accs(M, N)...)))
         end
     end
